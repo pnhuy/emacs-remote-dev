@@ -223,7 +223,7 @@ Paths: Elisp in ``, tests in `test/`, Python tests in `test/py/`, E2E in `test/e
 - [X] T109 [P] [US9] Install and user guide `docs/README.md` (install, first connection, SSH config, TCP/tunnel, commands, customization, troubleshooting) (FR-039, SC-014)
 - [X] T110 [P] [US9] Developer guide `docs/DEVELOPING.md` (layout, running all suites, sshd fixture, adding an RPC with capability, release checklist) (FR-039, SC-014)
 - [X] T111 [P] [US9] `docs/protocol.md` mirroring contracts/protocol.md with the non-cancellable list, plus `docs/blocking.md` explaining unavoidable synchronous blocking (plan table) and stating that atomic visibility of saves is distinct from power-loss durability (FR-013), and documenting the per-process output-queue limit (default 1 MiB, T074) (FR-032, SC-009)
-- [ ] T112 [US9] Walk-through validation: a fresh user follows `docs/README.md` timed ≤ 15 min; a contributor runs all suites from `DEVELOPING.md`; record in `docs/VALIDATION.md` (SC-014)
+- [ ] T112 [US9] Walk-through validation: a fresh user follows `docs/README.md` timed ≤ 15 min; a contributor runs all suites from `DEVELOPING.md`; record in `docs/VALIDATION.md` (SC-014) — DEFERRED: needs a human, timed fresh-user run; not performed
 
 ---
 

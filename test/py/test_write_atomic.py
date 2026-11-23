@@ -136,6 +136,49 @@ class WriteAtomic(unittest.TestCase):
         self.assertEqual(w["version"]["size"], 4)
         self.assertEqual(self.d.result("fs/stat", path=self.p)["version"], w["version"])
 
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses directory permissions")
+    def test_readonly_dir_writable_file_falls_back_in_place(self):
+        self.put()
+        os.chmod(self.t.name, 0o555)
+        self.addCleanup(os.chmod, self.t.name, 0o755)
+        res, err = self.wa()
+        self.assertIsNone(err)
+        self.assertFalse(res["atomic"])
+        self.assertEqual(open(self.p, "rb").read(), b"new")
+
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses directory permissions")
+    def test_readonly_dir_fallback_still_version_checked(self):
+        self.put()
+        v = self.d.result("fs/read", path=self.p)["version"]
+        self.put(b"external-edit-longer")
+        os.chmod(self.t.name, 0o555)
+        self.addCleanup(os.chmod, self.t.name, 0o755)
+        _, err = self.wa(expected=v)
+        self.assertEqual(err["code"], -32010)
+        self.assertEqual(open(self.p, "rb").read(), b"external-edit-longer")
+
+    def test_symlink_not_followed_replaces_link_not_target(self):
+        self.put()
+        link = os.path.join(self.t.name, "ln")
+        os.symlink("f", link)
+        res, err = self.d.call("fs/writeAtomic", path=link, data=b64(b"x"),
+                               follow_symlinks=False)
+        self.assertIsNone(err)
+        self.assertEqual(open(self.p, "rb").read(), b"v1")
+        self.assertFalse(os.path.islink(link))
+        self.assertEqual(open(link, "rb").read(), b"x")
+
+    def test_stale_temp_of_dead_pid_swept(self):
+        self.put()
+        stale = os.path.join(self.t.name, ".rdev-tmp-999999999-deadbeef")
+        live = os.path.join(self.t.name, ".rdev-tmp-%d-cafe0000" % os.getpid())
+        for x in (stale, live):
+            open(x, "w").close()
+            os.utime(x, (1, 1))
+        self.wa()
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.exists(live))
+
 
 if __name__ == "__main__":
     unittest.main()

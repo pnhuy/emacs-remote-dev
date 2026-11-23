@@ -149,5 +149,34 @@ class Stress(unittest.TestCase):
         sys.stderr.write("concurrency: %d rounds in %.1fs\n" % (ROUNDS, time.time() - t0))
 
 
+class WorkerPoolAccounting(unittest.TestCase):
+    def test_queued_work_uses_all_workers(self):
+        import threading
+        import time
+        m = helpers.load_module()
+        pool = m.WorkerPool(3)
+        started, gate = [], threading.Event()
+
+        def task(i):
+            started.append(i)
+            gate.wait(5)
+
+        for i in range(3):
+            pool.submit(task, i)
+            time.sleep(0.05)
+        # a quick task finishes, then more long tasks arrive
+        done = threading.Event()
+        pool.submit(done.set)
+        done.wait(5)
+        time.sleep(0.1)
+        for i in range(3, 5):
+            pool.submit(task, i)
+        time.sleep(0.3)
+        gate.set()
+        pool.close()
+        self.assertLessEqual(pool.threads, 3)
+        self.assertEqual(sorted(started), [0, 1, 2, 3, 4])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -57,6 +57,20 @@ class TcpAgent(unittest.TestCase):
         rpc(f, 20, "auth", {"token": "bad"})
         self.assertIsNone(rpc(f, 21, "hello"), "connection must close after repeated failures")
 
+    def test_non_ascii_token_counts_as_failure(self):
+        port = self.port(); self.start("127.0.0.1:%d" % port)
+        f = self.connect(port)
+        r = rpc(f, 1, "auth", {"token": "caf\u00e9"})
+        self.assertEqual(r["error"]["code"], -32002)
+
+    def test_short_token_warns_without_leaking_it(self):
+        port = self.port(); p = self.start("127.0.0.1:%d" % port, "--token", "short")
+        f = self.connect(port)
+        rpc(f, 1, "auth", {"token": "short"})
+        p.kill(); err = p.stderr.read().decode()
+        self.assertIn("weak", err.lower())
+        self.assertNotIn("short\n", err.replace("weak token", ""))
+
     def test_good_token_works(self):
         port = self.port(); self.start("127.0.0.1:%d" % port)
         f = self.connect(port)

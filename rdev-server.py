@@ -141,6 +141,7 @@ MAX_HEADER = 8192
 MAX_HEADER_LINES = 32
 MAX_MESSAGE = 33554432
 MAX_AUTH_FAILURES = 5
+_GLOBAL_AUTH_FAILURES = 0  # process-wide, for reconnect backoff
 PROJECT_MAX_FILES = 1000000
 VCS_MARKERS = {".git": "git", ".hg": "hg", ".svn": "svn"}
 PROJECT_MARKERS = (".git", ".hg", ".svn", "pyproject.toml", "package.json",
@@ -544,9 +545,9 @@ class WorkerPool:
     def submit(self, fn, *args):
         with self.lock:
             self.q.put((fn, args))
-            if self.idle > 0:
-                self.idle -= 1          # reserve a waiting worker
-            elif self.threads < self.n:
+            # Spawn only when every currently-blocked worker is already
+            # spoken for by queued work.
+            if self.idle < self.q.qsize() and self.threads < self.n:
                 self.threads += 1
                 threading.Thread(target=self._work, daemon=True).start()
 
@@ -558,7 +559,11 @@ class WorkerPool:
 
     def _work(self):
         while True:
+            with self.lock:
+                self.idle += 1
             item = self.q.get()
+            with self.lock:
+                self.idle -= 1
             if item is None:
                 return
             fn, args = item
@@ -566,8 +571,6 @@ class WorkerPool:
                 fn(*args)
             except Exception as e:  # noqa: BLE001
                 sys.stderr.write("rdev-server: worker error: %r\n" % (e,))
-            with self.lock:
-                self.idle += 1
 
 
 class Cancel:
@@ -1078,8 +1081,14 @@ class Session:
     # --- methods: session ---------------------------------------------
     def m_auth(self, token):
         if self.token is not None and not hmac.compare_digest(
-                str(token), self.token):
+                str(token).encode("utf-8", "surrogatepass"),
+                self.token.encode("utf-8", "surrogatepass")):
             self.auth_failures += 1
+            global _GLOBAL_AUTH_FAILURES
+            _GLOBAL_AUTH_FAILURES += 1
+            if _GLOBAL_AUTH_FAILURES > MAX_AUTH_FAILURES:
+                # Reconnecting must not reset the guess budget: back off.
+                time.sleep(min(2.0, 0.1 * (_GLOBAL_AUTH_FAILURES - MAX_AUTH_FAILURES)))
             if self.auth_failures >= MAX_AUTH_FAILURES:
                 self.closing = True  # serve() drops the connection
             raise RpcError(-32002, "bad token")
@@ -1262,9 +1271,13 @@ class Session:
 
         st = current()
         check(st)
-        if st is not None and (not stat.S_ISREG(st.st_mode) or st.st_nlink > 1):
-            # Cannot replace without breaking the link/special file.
-            fd = os.open(target, os.O_WRONLY | os.O_TRUNC)
+        is_link = st is not None and stat.S_ISLNK(st.st_mode)
+
+        def in_place():
+            # O_NOFOLLOW: never write through a symlink we were told not
+            # to follow (it is replaced atomically instead, see below).
+            fd = os.open(target, os.O_WRONLY | os.O_TRUNC
+                         | getattr(os, "O_NOFOLLOW", 0))
             try:
                 view = memoryview(payload)
                 while view:
@@ -1275,23 +1288,37 @@ class Session:
                 os.close(fd)
             return {"version": version_of(nst), "atomic": False,
                     "bytes": len(payload)}
+
+        if st is not None and not is_link and (
+                not stat.S_ISREG(st.st_mode) or st.st_nlink > 1):
+            # Cannot replace without breaking the link/special file.
+            return in_place()
         d = os.path.dirname(target) or "."
+        self._sweep_stale_tmp(d)
         if mode is not None:
             fmode = mode
-        elif st is not None:
+        elif st is not None and not is_link:
             fmode = stat.S_IMODE(st.st_mode)
         else:
             um = os.umask(0); os.umask(um)
             fmode = 0o666 & ~um
         tmp = os.path.join(d, ".rdev-tmp-%d-%s" % (os.getpid(), uuid.uuid4().hex[:8]))
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except OSError as e:
+            if (e.errno in (errno.EACCES, errno.EPERM, errno.EROFS)
+                    and st is not None and not is_link):
+                # Read-only directory, writable file: plain Emacs and
+                # TRAMP still save; same version check, atomic=false.
+                return in_place()
+            raise
         try:
             try:
                 view = memoryview(payload)
                 while view:
                     view = view[os.write(fd, view):]
                 os.fchmod(fd, fmode)
-                if st is not None:
+                if st is not None and not is_link:
                     try:
                         os.fchown(fd, st.st_uid, st.st_gid)
                     except OSError:
@@ -1317,6 +1344,35 @@ class Session:
             pass
         return {"version": version_of(os.lstat(target)), "atomic": True,
                 "bytes": len(payload)}
+
+    @staticmethod
+    def _sweep_stale_tmp(d):
+        """Remove ``.rdev-tmp-<pid>-<hex>`` left by a killed agent (dead pid,
+        older than a minute).  Best effort; never raises."""
+        try:
+            names = os.listdir(d)
+        except OSError:
+            return
+        now = time.time()
+        for n in names:
+            parts = n.split("-")
+            if not (n.startswith(".rdev-tmp-") and len(parts) == 4
+                    and parts[2].isdigit()):
+                continue
+            pid = int(parts[2])
+            try:
+                os.kill(pid, 0)
+                continue                   # owner alive
+            except ProcessLookupError:
+                pass
+            except OSError:
+                continue
+            try:
+                full = os.path.join(d, n)
+                if now - os.lstat(full).st_mtime > 60:
+                    os.unlink(full)
+            except OSError:
+                pass
 
     # --- methods: chunked transfer (cap fs.chunk, FR-015) ---------------
     def _sweep_transfers(self):
@@ -2034,6 +2090,9 @@ def resolve_token(args, port):
     elif args.token:
         token = args.token
     if token:
+        if len(token) < 16:
+            sys.stderr.write("warning: weak token (< 16 characters); use at "
+                             "least 128 bits, e.g. omit --token to generate one\n")
         return token
     import secrets
     token = secrets.token_urlsafe(32)

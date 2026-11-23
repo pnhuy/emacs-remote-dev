@@ -31,8 +31,10 @@ python3 rdev-server.py --listen 127.0.0.1:7777 --token-file ~/.rdev/token
 
 Then connect with the token from `~/.rdev/token`. Use `--token-file` (or `RDEV_TOKEN`), not
 `--token`: argv is visible in the process list and the agent warns about it. Five failed
-authentications close the connection. Tokens are 128-bit or more, stored in a 0600 file, and
-never written to logs, `rdev-status` or messages.
+authentications close the connection, and failures are counted process-wide: once the budget is
+spent, further failed attempts (including after reconnecting) are slowed. Generated tokens are
+256-bit, stored in a 0600 file; a user-supplied token shorter than 16 characters is accepted but
+the agent warns that it is weak. Tokens are never written to logs, `rdev-status` or messages.
 
 ## What is logged
 Connection transitions and agent stderr go to the per-connection log buffer. Values of
