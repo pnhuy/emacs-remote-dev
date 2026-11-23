@@ -752,6 +752,19 @@ capability to stop working on the request (`$/cancel'), then re-signal."
         (inhibit-file-name-operation operation))
     (apply operation args)))
 
+(defun rdev--local-temp-file (prefix &optional dir-flag suffix)
+  "Like `make-temp-file' but always create the file on the local machine.
+With a remote `default-directory' (or a remote `temporary-file-directory',
+as callers such as Magit may bind), `make-temp-file' would pick a remote temp
+directory and re-enter the rdev `write-region' handler without end."
+  (let* ((tmp (if (file-remote-p temporary-file-directory)
+                  (or (default-toplevel-value 'temporary-file-directory) "/tmp/")
+                temporary-file-directory))
+         (tmp (if (file-remote-p tmp) "/tmp/" tmp))
+         (temporary-file-directory tmp)
+         (default-directory tmp))
+    (make-temp-file prefix dir-flag suffix)))
+
 (defvar rdev--ops (make-hash-table :test #'eq))
 
 (defmacro rdev-defop (op args &rest body)
@@ -1117,7 +1130,7 @@ destination stays untouched and the temporary file is removed."
                (size (and (rdev-conn-has-cap (rdev--conn host) "fs.chunk")
                           (plist-get (ignore-errors (rdev--stat filename)) :size)))
                (chunked (rdev--use-chunks-p host size))
-               (tmp (make-temp-file "rdev-"))
+               (tmp (rdev--local-temp-file "rdev-"))
                (res (condition-case err
                         (if chunked
                             (let ((v (rdev--chunked-read host local filename tmp size)))
@@ -1148,7 +1161,7 @@ destination stays untouched and the temporary file is removed."
 (rdev-defop file-local-copy (filename)
   (pcase-let* ((`(,host . ,local) (rdev--parse (expand-file-name filename)))
                (res (rdev--req host :fs/read `(:path ,local) filename))
-               (tmp (make-temp-file "rdev-" nil (file-name-extension filename t))))
+               (tmp (rdev--local-temp-file "rdev-" nil (file-name-extension filename t))))
     (rdev--write-local-bytes (base64-decode-string (plist-get res :data)) tmp)
     tmp))
 
@@ -1171,8 +1184,8 @@ buffer stays modified; nothing is overwritten silently."
 
 (defun rdev-conflict-show-diff (filename)
   "Show a diff between the current buffer and the remote copy of FILENAME."
-  (let ((remote (make-temp-file "rdev-remote-"))
-        (mine (make-temp-file "rdev-mine-")))
+  (let ((remote (rdev--local-temp-file "rdev-remote-"))
+        (mine (rdev--local-temp-file "rdev-mine-")))
     (unwind-protect
         (progn
           (rdev--write-local-bytes (rdev--read-remote-for-diff filename) remote)
@@ -1218,7 +1231,7 @@ buffer stays modified; nothing is overwritten silently."
 (rdev-defop write-region (start end filename &optional append visit _lockname mustbenew)
   (pcase-let* ((filename (expand-file-name filename))
                (`(,host . ,local) (rdev--parse filename))
-               (tmp (make-temp-file "rdev-")))
+               (tmp (rdev--local-temp-file "rdev-")))
     (when (and mustbenew (rdev--stat filename))
       (if (eq mustbenew 'excl)
           (signal 'file-already-exists (list "File exists" filename))
@@ -1866,7 +1879,7 @@ Bound by `rdev-search' for the duration of one search; nil otherwise.")
                ;; through this primitive, which would otherwise run locally.
                (lambda (start end program &optional delete buffer display &rest rest)
                  (if (rdev--host (expand-file-name default-directory))
-                     (let ((tmp (make-temp-file "rdev-stdin"))
+                     (let ((tmp (rdev--local-temp-file "rdev-stdin"))
                            (coding-system-for-write 'no-conversion))
                        (unwind-protect
                            (progn
