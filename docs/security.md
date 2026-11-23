@@ -1,0 +1,46 @@
+# RDEV security model
+
+## Trust boundaries
+- **SSH is the transport and the authenticator.** RDEV uses your `ssh` command, keys, agent and
+  `known_hosts` as-is. It never stores passwords or manages keys (Article IV).
+- The **agent runs as your remote user** and refuses to run as root (exit 5). It can do exactly
+  what that account can do, nothing more.
+- The local **relay socket** lives in a 0700 directory (`$XDG_RUNTIME_DIR/rdev` or
+  `~/.cache/rdev/run`) and is itself 0600, so other local users cannot connect. Emacs Lisp cannot
+  read a peer's uid, so the Lisp side relies on directory ownership plus modes and on a
+  per-session token: Emacs passes 16 random bytes (hex) to each relay in `RDEV_RELAY_TOKEN`
+  (removed from the relay's environment at start), the relay sends it as a fourth field of
+  its `H` hello frame, and Emacs aborts any socket whose hello lacks the right token. The relay
+  itself checks (`SO_PEERCRED` / `LOCAL_PEERCRED`) that the socket server runs as its own uid
+  and exits 255 otherwise. The cross-uid refusal is covered by a unit test with a patched
+  uid; it was not exercised with a real second user.
+- The JSON-RPC input is validated: bounded headers/messages, typed parameters, no NUL in paths,
+  commands as argv (never through a shell unless you ask for `shell-command`).
+
+## Recommended TCP setup: tunnel over SSH
+The agent's `--listen` mode exists for tests and special setups. It binds loopback only and
+refuses anything else unless `--allow-non-loopback` is given (the traffic is then plaintext and
+every connect warns). Prefer a tunnel:
+
+```sh
+# on your machine: forward a local port to the agent listening on the remote loopback
+ssh -N -L 7777:127.0.0.1:7777 user@host &
+# on the remote host (started by you, as yourself):
+python3 rdev-server.py --listen 127.0.0.1:7777 --token-file ~/.rdev/token
+```
+
+Then connect with the token from `~/.rdev/token`. Use `--token-file` (or `RDEV_TOKEN`), not
+`--token`: argv is visible in the process list and the agent warns about it. Five failed
+authentications close the connection. Tokens are 128-bit or more, stored in a 0600 file, and
+never written to logs, `rdev-status` or messages.
+
+## What is logged
+Connection transitions and agent stderr go to the per-connection log buffer. Values of
+environment variables whose names look sensitive (token, secret, password, key) and token
+strings are redacted before they are written.
+
+## Known limits
+- Same-uid processes on a machine can reach that uid's relay socket and agent; RDEV does not
+  defend against an attacker who already runs as you.
+- Emacs cannot verify the peer uid of a relay connection (no Lisp API); the token above stands in.
+- Plain `--allow-non-loopback` exposes an unencrypted channel by design of that opt-in.

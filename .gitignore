@@ -1,0 +1,26 @@
+# Byte-compiled / generated
+*.elc
+*.eln
+eln-cache/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Editor and OS
+.DS_Store
+*~
+\#*\#
+.#*
+.dir-locals.el
+.vscode/
+.idea/
+
+# Local test and benchmark output (reproducible; keep bench/results/ CSVs that are committed on purpose)
+/tmp/
+*.log
+*.tmp
+.rdev-tmp-*
+
+# Claude Code local state
+.claude/settings.local.json
+.claude/projects/

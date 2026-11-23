@@ -1,0 +1,80 @@
+;;; rdev-handlers-mutate-test.el --- copy/rename/delete/symlink (T019)  -*- lexical-binding: t; -*-
+(require 'rdev-test-helpers)
+
+(defun rdev-test--slurp (f)
+  (with-temp-buffer (set-buffer-multibyte nil)
+    (let ((coding-system-for-read 'no-conversion)) (insert-file-contents-literally f))
+    (buffer-string)))
+
+(ert-deftest rdev-mut-copy-file-same-host ()
+  (rdev-test-with-twin-dir (native remote)
+    (copy-file (concat remote "a.txt") (concat remote "c.txt"))
+    (should (equal (rdev-test--slurp (concat (file-local-name remote) "c.txt"))
+                   (rdev-test--slurp (concat native "a.txt"))))
+    (should-error (copy-file (concat remote "a.txt") (concat remote "c.txt"))
+                  :type 'file-already-exists)
+    (copy-file (concat remote "bin.dat") (concat remote "c.txt") t)
+    (should (= 256 (length (rdev-test--slurp (concat (file-local-name remote) "c.txt")))))
+    (copy-file (concat remote "a.txt") (concat remote "sub/"))
+    (should (file-exists-p (concat remote "sub/a.txt")))))
+
+(ert-deftest rdev-mut-copy-between-local-and-remote ()
+  (rdev-test-with-twin-dir (native remote)
+    (let ((loc (make-temp-file "rdev-loc")))
+      (unwind-protect
+          (progn
+            (copy-file (concat remote "bin.dat") loc t)
+            (should (equal (rdev-test--slurp loc) (rdev-test--slurp (concat native "bin.dat"))))
+            (copy-file loc (concat remote "up.dat"))
+            (should (equal (rdev-test--slurp (concat (file-local-name remote) "up.dat"))
+                           (rdev-test--slurp loc))))
+        (delete-file loc)))))
+
+(ert-deftest rdev-mut-rename-file ()
+  (rdev-test-with-twin-dir (native remote)
+    (rename-file (concat remote "a.txt") (concat remote "r.txt"))
+    (should-not (file-exists-p (concat remote "a.txt")))
+    (should (file-exists-p (concat remote "r.txt")))
+    (should-error (rename-file (concat remote "unicode.txt") (concat remote "r.txt"))
+                  :type 'file-already-exists)
+    (rename-file (concat remote "unicode.txt") (concat remote "r.txt") t)
+    (should-not (file-exists-p (concat remote "unicode.txt")))))
+
+(ert-deftest rdev-mut-delete-file ()
+  (rdev-test-with-twin-dir (native remote)
+    (should (file-exists-p (concat remote "a.txt")))
+    (delete-file (concat remote "a.txt"))
+    (should-not (file-exists-p (concat remote "a.txt")))
+    ;; Deleting a missing file is silent, like native `delete-file'.
+    (should-not (delete-file (concat remote "a.txt")))
+    (should-not (delete-file (concat native "a.txt")))))
+
+(ert-deftest rdev-mut-symlinks ()
+  (rdev-test-with-twin-dir (native remote)
+    (should (equal (file-symlink-p (concat remote "link")) "a.txt"))
+    (make-symbolic-link "a.txt" (concat remote "l2"))
+    (should (equal (file-symlink-p (concat remote "l2")) "a.txt"))
+    (should-error (make-symbolic-link "b" (concat remote "l2")) :type 'file-already-exists)
+    (make-symbolic-link "sub/b.txt" (concat remote "l2") t)
+    (should (equal (file-symlink-p (concat remote "l2")) "sub/b.txt"))
+    (should (equal (file-truename (concat remote "link"))
+                   (concat (file-remote-p remote) (file-truename (concat (file-local-name remote) "a.txt")))))))
+
+(ert-deftest rdev-mut-modes-and-times ()
+  (rdev-test-with-twin-dir (native remote)
+    (set-file-modes (concat remote "a.txt") #o600)
+    (should (= #o600 (file-modes (concat remote "a.txt"))))
+    (set-file-times (concat remote "a.txt") (encode-time '(0 0 0 1 1 2020 nil nil t)))
+    (should (< (abs (- (float-time (file-attribute-modification-time
+                                    (file-attributes (concat remote "a.txt"))))
+                       1577836800.0))
+               2))
+    (should-error (set-file-modes (concat remote "nonexistent") #o600) :type 'file-missing)))
+
+(ert-deftest rdev-mut-add-name-to-file ()
+  (rdev-test-with-twin-dir (native remote)
+    (add-name-to-file (concat remote "a.txt") (concat remote "hard"))
+    (should (= 2 (file-attribute-link-number (file-attributes (concat remote "hard")))))))
+
+(provide 'rdev-handlers-mutate-test)
+;;; rdev-handlers-mutate-test.el ends here
