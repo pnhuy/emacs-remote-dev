@@ -3,6 +3,19 @@
 Entries are added only when a fix deliberately changes behavior pinned by the baseline.
 Each entry: date, task, test changed, rationale, migration note.
 
+## 2026-11-28 — `fs/read` and `fs/readChunk` refuse non-regular files
+- **Before**: both methods called `open()` on any path. A socket failed with
+  `ENXIO` ("No such device or address"), a FIFO blocked the agent's only RPC connection until a
+  writer appeared, and an endless device such as `/dev/zero` was read until memory ran out.
+- **After**: the path is checked with `stat`, opened with `O_NONBLOCK`, and checked again on the
+  open fd. Anything that is not a regular file fails at once with `-32001`, message
+  `not a regular file`, errno `EINVAL`; the client signals
+  `(file-error "rdev" "not a regular file" FILE)`, like Emacs's own "not a regular file".
+  Directories still fail with `EISDIR`.
+- **Tests**: `test/py/test_read_nonregular.py` (socket, FIFO without blocking, `/dev/zero`,
+  regular file unchanged); ERT `rdev-io-non-regular-file-signals`.
+- **Migration**: none. Reading a device or FIFO through RDEV was never usable.
+
 ## 2026-11-28 — Docker: review fixes (failure records, display name, exec by ID)
 - **Before**: a connect whose `docker inspect` failed recorded no state (the key was resolved
   before the failure handling), and a reconnect to a removed container dropped the cached key, so

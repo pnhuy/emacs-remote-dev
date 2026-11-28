@@ -195,6 +195,30 @@ def os_error(e):
                      "filename": getattr(e, "filename", None)})
 
 
+def open_regular(path):
+    """Open PATH for reading, refusing anything but a regular file.
+
+    A FIFO would block the single RPC connection in open(), a character
+    device such as /dev/zero would be read without end, and a socket fails
+    with a confusing ENXIO.  Check the type before opening, open without
+    blocking, then check the opened fd again (the path may have been
+    replaced in between).  Directories keep their EISDIR error."""
+    def refuse(st):
+        if stat.S_ISDIR(st.st_mode):
+            raise OSError(errno.EISDIR, os.strerror(errno.EISDIR), path)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", path)
+    refuse(os.stat(path))
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0))
+    try:
+        refuse(os.fstat(fd))
+        os.set_blocking(fd, True)
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 _uname, _gname = {}, {}
 
 
@@ -1217,7 +1241,7 @@ class Session:
         return out
 
     def m_fs_read(self, path):
-        with open(path, "rb") as f:
+        with open_regular(path) as f:
             st = os.fstat(f.fileno())      # version from the same open fd
             data = f.read()
         return {"data": b64(data), "mtime": st.st_mtime_ns,
@@ -1406,7 +1430,7 @@ class Session:
         if length > MAX_CHUNK:
             raise RpcError(-32011, "length exceeds max_chunk",
                            {"max_chunk": MAX_CHUNK})
-        with open(path, "rb") as f:
+        with open_regular(path) as f:
             st = os.fstat(f.fileno())
             ver = version_of(st)
             if expected is not None and any(

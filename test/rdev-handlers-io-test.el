@@ -95,5 +95,19 @@
     (should-error (insert-file-contents (concat remote "nonexistent")) :type 'file-missing)
     (should-error (file-local-copy (concat remote "nonexistent")) :type 'file-missing)))
 
+(ert-deftest rdev-io-non-regular-file-signals ()
+  "A socket, FIFO or device is refused with a clear error, never read or waited on."
+  (rdev-test-with-twin-dir (_native remote)
+    (call-process "mkfifo" nil nil nil (file-local-name (concat remote "fifo")))
+    (let ((sock (make-network-process :name "rdev-test-sock" :family 'local :server t
+                                      :service (file-local-name (concat remote "sock")))))
+      (unwind-protect
+          (dolist (n '("fifo" "sock"))
+            (let ((err (should-error (insert-file-contents (concat remote n))
+                                     :type 'file-error)))
+              (should-not (eq (car err) 'file-missing))
+              (should (member "not a regular file" err))))
+        (delete-process sock)))))
+
 (provide 'rdev-handlers-io-test)
 ;;; rdev-handlers-io-test.el ends here
