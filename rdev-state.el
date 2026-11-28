@@ -112,6 +112,14 @@ An illegal move is logged and ignored (signals `error' if
 
 (defvar rdev-state-ssh-g-function #'rdev-state--ssh-g
   "Function (HOST) returning ssh -G output as a string, or nil.")
+(defvar rdev-state-docker-key-function nil
+  "Function (HOST) returning HOST's Docker session key, or nil.
+Nil means HOST is not a Docker target.  Installed by rdev-docker after
+loading; nil until then,
+so ssh-only users never resolve Docker identities.  Docker keys embed the
+immutable container ID and are deliberately NOT cached across connects:
+rdev.el drops the cache entry before every (re)connect so the identity is
+re-resolved (a container recreated under the same name is a new session).")
 (defvar rdev-state--keys (make-hash-table :test #'equal))
 
 (defun rdev-state--ssh-g (host)
@@ -126,18 +134,23 @@ An illegal move is logged and ignored (signals `error' if
         (buffer-string)))))
 
 (defun rdev-state-session-key (host)
-  "Canonical \"user@hostname:port\" for ssh alias HOST (FR-008).
-Falls back to HOST itself when `ssh -G' is unavailable."
+  "Canonical session key for HOST (FR-008).
+SSH targets get \"user@hostname:port\" (HOST itself when `ssh -G' is
+unavailable); Docker targets get `docker:<engine>:<container-id>' from
+`rdev-state-docker-key-function'."
   (or (gethash host rdev-state--keys)
-      (let* ((out (ignore-errors (funcall rdev-state-ssh-g-function host)))
+      (let* ((docker (and rdev-state-docker-key-function
+                          (funcall rdev-state-docker-key-function host)))
+             (out (unless docker (ignore-errors (funcall rdev-state-ssh-g-function host))))
              (field (lambda (k)
                       (and out (string-match
                                 (format "^%s \\(.+\\)$" k) out)
                            (match-string 1 out))))
-             (key (let ((h (funcall field "hostname"))
-                        (u (funcall field "user"))
-                        (p (funcall field "port")))
-                    (if (and h u p) (format "%s@%s:%s" u h p) host))))
+             (key (or docker
+                      (let ((h (funcall field "hostname"))
+                            (u (funcall field "user"))
+                            (p (funcall field "port")))
+                        (if (and h u p) (format "%s@%s:%s" u h p) host)))))
         (puthash host key rdev-state--keys)
         key)))
 

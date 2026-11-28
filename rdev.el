@@ -42,14 +42,21 @@
 (defcustom rdev-hosts nil
   "Per-host connection settings, an alist of (HOST . PLIST).
 PLIST keys:
-  :transport  `ssh' (default) or `tcp'
+  :transport  `ssh' (default), `tcp', or `docker'
   :ssh-host   ssh destination (defaults to HOST)
   :address    TCP address (defaults to HOST)
   :port       TCP port
   :token      TCP auth token, or :token-file FILE
   :tls        non-nil to wrap TCP in TLS
   :insecure-ok non-nil to allow plaintext TCP to a non-loopback address
-              (see also `rdev-allow-insecure-tcp')"
+              (see also `rdev-allow-insecure-tcp')
+Docker targets instead use:
+  :container  container name or ID (defaults to HOST)
+  :docker-host SSH destination of the engine host (nil = local engine)
+  :docker-user container account for `docker exec --user'
+  :docker-program Docker executable (defaults to `rdev-docker-program')
+  :allow-root non-nil to allow a root-only container (documented
+              exception; warns and logs on every connection)"
   :type '(alist :key-type string :value-type plist))
 
 (defcustom rdev-allow-insecure-tcp nil
@@ -61,6 +68,67 @@ ssh transport or `:tls t'; per-host override: `:insecure-ok t'."
 (defcustom rdev-ssh-args '("-T" "-o" "BatchMode=yes" "-o" "ServerAliveInterval=15")
   "Extra arguments given to ssh when bootstrapping a server."
   :type '(repeat string))
+
+(defcustom rdev-docker-program "docker"
+  "Docker executable used for :transport `docker' targets.
+May be overridden per target with :docker-program; on a remote engine it is
+a path on the engine host."
+  :type 'string)
+
+(defcustom rdev-docker-discovery-ttl 5
+  "Seconds a `docker ps' discovery snapshot stays fresh."
+  :type 'number)
+
+(defcustom rdev-docker-discovery-max 200
+  "Maximum number of containers listed by discovery and completion."
+  :type 'natnum)
+
+(defcustom rdev-docker-timeout 30
+  "Seconds to wait for one Docker CLI call (inspect, ps)."
+  :type 'integer)
+
+(defcustom rdev-docker-probe-timeout 10
+  "Seconds for the in-container environment probe.
+The root-policy and shell/Python probes use this short bound so an
+unsupported container is reported quickly, independently of
+`rdev-docker-timeout'."
+  :type 'integer)
+
+(defcustom rdev-docker-auto-detect t
+  "Non-nil to offer running local containers in `/rdev:' host completion.
+Containers are offered under explicit `docker+NAME' keys, so choosing one
+is always a deliberate Docker choice: a plain host name is never resolved
+to a container, whatever is running.  Discovery runs in the background and
+completion never waits longer than `rdev-docker-discovery-wait'.  Set this
+to nil to stop querying the local engine; containers on the engines of
+configured Docker targets are still offered."
+  :type 'boolean)
+
+(defcustom rdev-docker-auto-detect-timeout 2
+  "Seconds allowed for one background discovery `docker ps'.
+A lookup that takes longer is killed and counts as a failure (see
+`rdev-docker-discovery-backoff')."
+  :type 'number)
+
+(defcustom rdev-docker-discovery-wait 0.3
+  "Seconds completion may wait for discovery when it has no snapshot yet.
+Only the call that starts a lookup waits, and only this long; later calls
+use whatever snapshot exists, so a slow or hung engine never stalls
+completion."
+  :type 'number)
+
+(defcustom rdev-docker-discovery-backoff 30
+  "Seconds before a failed background discovery is retried for that engine."
+  :type 'number)
+
+(defcustom rdev-docker-allow-root nil
+  "Non-nil to allow the helper to run as root in every Docker target.
+This is the global default for targets that do not set :allow-root; a
+target's :allow-root t still enables it when the global default is nil.
+Off by default.  Every connection to a root container warns and logs the
+elevated privilege.  Treat container root as host-equivalent when the
+container mounts host paths or the Docker socket."
+  :type 'boolean)
 
 (defcustom rdev-python "python3"
   "Local Python used to run the process relay."
@@ -115,7 +183,9 @@ touching the destination."
   host rpc home path (cache (make-hash-table :test #'equal))
   ;; Added for protocol negotiation and diagnostics (appended: keeps
   ;; positional compatibility with the original slots).
-  state gen proto caps limits transport log stats procs policy)
+  state gen proto caps limits transport log stats procs policy
+  ;; Docker target bookkeeping (appended again: same compatibility rule).
+  container container-name engine root-mode)
 
 (cl-defstruct (rdev-chan (:constructor rdev--make-chan))
   id host proc sock cmd cwd pty merge env exited
@@ -193,9 +263,68 @@ WHAT names the awaited event in the timeout error."
                 host))
   host)
 
-(defconst rdev--bootstrap-template
+;; The Docker transport lives in rdev-docker.el, loaded only when a Docker
+;; target is used, so the ssh/tcp path has no new load-time dependency.
+(declare-function rdev-docker--process "rdev-docker" (host spec))
+(declare-function rdev-docker--refresh-identity "rdev-docker" (host))
+(declare-function rdev-docker--engine-key "rdev-docker" (spec))
+(declare-function rdev-docker--fallback-key "rdev-docker" (host))
+(declare-function rdev-docker--completion-hosts "rdev-docker" nil)
+
+(defconst rdev--docker-address-regexp
+  "\\`docker\\+\\([A-Za-z0-9][A-Za-z0-9_.-]*\\)\\(?:@\\(.+\\)\\)?\\'"
+  "Matches the explicit container address `docker+NAME[@ENGINE-HOST]'.
+Group 1 is the container name, group 2 the optional SSH destination of a
+remote engine.  `+' cannot occur in a DNS host name or a container name.")
+
+(defun rdev--docker-address-spec (host)
+  "Docker spec for the explicit container address HOST, or nil.
+`docker+NAME' is the container NAME on the local engine and
+`docker+NAME@DH' is NAME on the engine reached over SSH at DH.  Parsing is
+pure: nothing is queried and `rdev-hosts' is not changed."
+  (when (and (stringp host) (string-match rdev--docker-address-regexp host))
+    (let ((name (match-string 1 host))
+          (dh (match-string 2 host)))
+      (append (list :transport 'docker :container name)
+              (and dh (list :docker-host dh))))))
+
+(defun rdev--host-spec (host)
+  "The connection PLIST for HOST, or nil (SSH).
+An `rdev-hosts' entry wins, even one with a nil plist; otherwise an
+explicit `docker+NAME[@DH]' address yields its Docker spec."
+  (if-let* ((entry (assoc host rdev-hosts)))
+      (cdr entry)
+    (rdev--docker-address-spec host)))
+
+(defun rdev--docker-p (host)
+  "Non-nil when HOST is configured as a Docker (:transport docker) target."
+  (eq (plist-get (rdev--host-spec host) :transport) 'docker))
+
+(defun rdev--any-docker-target-p ()
+  "Non-nil when any `rdev-hosts' entry is a Docker target."
+  (cl-some (lambda (e) (eq (plist-get (cdr e) :transport) 'docker))
+           rdev-hosts))
+
+;; One bootstrap for both transports: the ssh path must stay byte-identical
+;; (its output is hash-pinned on remote hosts), so HOME-FALLBACK and
+;; AGENT-ARGS only change what the Docker transport asks for.
+(defun rdev--bootstrap-script (&optional home-fallback agent-args)
+  "Return the remote bootstrap script (printf-style: hash, size, sha256).
+HOME-FALLBACK adds the /tmp/rdev-<uid> fallback used by Docker targets when
+$HOME is unset or unwritable; the ssh path keeps `$HOME/.cache/rdev'
+unchanged.  AGENT-ARGS are appended to the agent's command line (the
+documented `--allow-root' opt-in)."
   (concat
-   "umask 077; D=\"$HOME/.cache/rdev\"; F=\"$D/rdev-server-%s.py\"; N=%d; H=%s; "
+   "umask 077; D=\"$HOME/.cache/rdev\""
+   (if home-fallback
+       ;; The shared /tmp fallback is used only when this account owns both
+       ;; directories and neither is a symlink (no pre-planted directory).
+       "; if ! mkdir -p \"$D\" 2>/dev/null; then B=\"/tmp/rdev-$(id -u)\"; D=\"$B/rdev\"; \
+{ mkdir -p \"$D\" 2>/dev/null && [ ! -L \"$B\" ] && [ -O \"$B\" ] && [ ! -L \"$D\" ] && [ -O \"$D\" ] \
+&& chmod 700 \"$B\" \"$D\"; } || { echo 'RDEV-ERR no writable directory for the rdev helper \
+(/tmp/rdev-UID is missing, not owned by this account, or a symlink)'; exit 4; }; fi"
+     "")
+   "; F=\"$D/rdev-server-%s.py\"; N=%d; H=%s; "
    "P=$(command -v python3 || echo /usr/bin/python3); "
    ;; Python >= 3.8 probe (Article VI).
    "if ! \"$P\" -c 'import sys;sys.exit(0 if sys.version_info>=(3,8) else 1)' 2>/dev/null; "
@@ -208,8 +337,11 @@ WHAT names the awaited event in the timeout error."
    ;; install only if the received bytes verify.
    "if v \"$T\"; then chmod 700 \"$T\" && mv \"$T\" \"$F\"; "
    "else rm -f \"$T\"; echo 'RDEV-ERR agent upload was truncated or corrupted'; exit 4; fi; fi; "
-   "echo RDEV-READY; exec \"$P\" -u \"$F\" --stdio")
-  "Remote bootstrap script (printf-style: short hash, size, sha256).")
+   "echo RDEV-READY; exec \"$P\" -u \"$F\" --stdio" (or agent-args "")))
+
+(defconst rdev--bootstrap-template (rdev--bootstrap-script)
+  "Remote bootstrap script (printf-style: short hash, size, sha256).
+Byte-identical to `(rdev--bootstrap-script)' with no arguments.")
 
 (defun rdev--bootstrap-filter (proc string)
   "Track RDEV-BOOT/RDEV-ERR/RDEV-READY markers in output STRING from PROC.
@@ -292,7 +424,17 @@ SPEC is the connection plist; its :ssh-host overrides HOST for ssh."
 (defvar rdev--gens (make-hash-table :test #'equal) "HOST -> connection generation.")
 (defvar rdev--key-hosts (make-hash-table :test #'equal)
   "Session key -> the host name used to (re)connect it.")
+(defvar rdev--host-keys (make-hash-table :test #'equal)
+  "HOST -> the session key last computed for it.
+Docker targets use it to detect a container replaced under the same name:
+a new identity retires the old session with empty caches.")
 (defvar rdev--reconnecting nil "Non-nil while the reconnect timer is connecting.")
+(defvar rdev--reconnect-key nil
+  "Session key the current reconnect attempt is for, or nil.
+A Docker container replaced under the same name resolves to a NEW key during
+the attempt; that key is not the one being reconnected, so it must run the
+ordinary connecting transitions instead of being treated as already in
+flight.")
 
 (defun rdev--flush-stderr-to-log (host key)
   "Move ssh/agent stderr collected for HOST into the redacted log of KEY."
@@ -309,8 +451,27 @@ State changes are recorded by `rdev-state-transition'.  A second connect
 while one is in flight signals `rdev-connection-lost' instead of racing."
   ;; Validate before anything runs ssh (even `ssh -G' for the session key).
   (rdev--validate-host host)
-  (let* ((key (rdev-state-session-key host))
-         (twin (rdev--live-alias-conn host key)))
+  ;; Docker targets re-resolve their container identity on every connect and
+  ;; reconnect: the identity is part of the session key, so a recreated
+  ;; container starts a new session with empty caches.
+  ;; A container that cannot be inspected (gone, stopped engine) still gets
+  ;; a session key, so the failure below is recorded and shown.
+  (let* ((ident-err nil)
+         (key (if (rdev--docker-p host)
+                  (progn
+                    (require 'rdev-docker)
+                    (condition-case err
+                        (rdev-docker--refresh-identity host)
+                      ((error quit)
+                       (setq ident-err err)
+                       (rdev-docker--fallback-key host))))
+                (rdev-state-session-key host)))
+         ;; Only the key the reconnect was scheduled for is "in flight"; a
+         ;; container replaced under the same name yields a new key that
+         ;; must connect normally.
+         (reconnecting (and rdev--reconnecting
+                            (equal key rdev--reconnect-key)))
+         (twin (and (not ident-err) (rdev--live-alias-conn host key))))
     (or twin
         (progn
           (when (and (rdev-state-attempt-in-flight-p key) (not rdev--reconnecting))
@@ -318,13 +479,16 @@ while one is in flight signals `rdev-connection-lost' instead of racing."
                     (list (format "rdev: connection to %s is %s; retry shortly"
                                   host (rdev-state key)))))
           (puthash key host rdev--key-hosts)
-          (unless rdev--reconnecting
+          (puthash host key rdev--host-keys)
+          (unless reconnecting
             ;; A stale `connected' state (transport already gone) is reset.
             (when (memq (rdev-state key) '(connected degraded))
               (rdev-state-user-disconnect key))
             (rdev-state-transition key 'connecting))
           (condition-case err
-              (rdev--connect-1 host key)
+              (if ident-err
+                  (signal (car ident-err) (cdr ident-err))
+                (rdev--connect-1 host key))
             ((error quit)
              (rdev--flush-stderr-to-log host key)
              (rdev-state-log key "connect failed: %s" (error-message-string err))
@@ -345,12 +509,15 @@ while one is in flight signals `rdev-connection-lost' instead of racing."
     found))
 
 (defun rdev--connect-1 (host key)
-  (let* ((spec (cdr (assoc host rdev-hosts)))
+  (let* ((spec (rdev--host-spec host))
          (tcp (eq (plist-get spec :transport) 'tcp))
+         (docker (eq (plist-get spec :transport) 'docker))
          (proc (progn
                  (unless (or tcp (eq (rdev-state key) 'reconnecting))
                    (rdev-state-transition key 'bootstrapping))
-                 (if tcp (rdev--tcp-process host spec) (rdev--ssh-process host spec))))
+                 (cond (docker (rdev-docker--process host spec))
+                       (tcp (rdev--tcp-process host spec))
+                       (t (rdev--ssh-process host spec)))))
          (_ (rdev-state-transition key 'initializing))
          (rpc (jsonrpc-process-connection
                :name (format "rdev-%s" host)
@@ -396,7 +563,13 @@ while one is in flight signals `rdev-connection-lost' instead of racing."
                                   :proto (format "%d.%d" (car proto) (cdr proto))
                                   :caps (append (plist-get hello :capabilities) nil)
                                   :limits (plist-get hello :limits)
-                                  :transport (if tcp 'tcp 'ssh)
+                                  :transport (cond (docker 'docker)
+                                                   (tcp 'tcp)
+                                                   (t 'ssh))
+                                  :container (and docker (process-get proc 'rdev-container))
+                                  :container-name (and docker (process-get proc 'rdev-container-name))
+                                  :engine (and docker (rdev-docker--engine-key spec))
+                                  :root-mode (and docker (process-get proc 'rdev-root-mode))
                                   :stats (list :agent (plist-get hello :version))))
       (puthash host conn rdev--conns)
       (rdev-state-transition key 'connected)
@@ -504,10 +677,14 @@ Presence of an entry means a probe is in flight.")
 (defun rdev--reconnect-attempt (key)
   "Reconnect session KEY; installed in `rdev-state-connect-function'."
   (let ((rdev--reconnecting t)
+        (rdev--reconnect-key key)
         (host (gethash key rdev--key-hosts)))
     (unless host (error "No host recorded for session %s" key))
     (rdev--connect host)
-    (rdev--connect-succeeded key)))
+    ;; The session key may have changed: a Docker container replaced under the
+    ;; same name retires KEY and starts a new one, so report against the
+    ;; session that is actually connected now.
+    (rdev--connect-succeeded (rdev-state-session-key host))))
 
 (defun rdev--connect-succeeded (_key) nil)
 
@@ -527,6 +704,10 @@ Presence of an entry means a probe is in flight.")
 (define-error 'rdev-connection-lost "rdev connection lost" 'file-error)
 (define-error 'rdev-ssh-error "rdev SSH error" 'file-error)
 (define-error 'rdev-transport-error "rdev transport error" 'file-error)
+(define-error 'rdev-docker-error "rdev Docker error" 'rdev-transport-error)
+;; `rdev-docker-error' data is (MESSAGE REASON) with REASON one of:
+;;   not-found, not-running, permission, engine-unreachable, unsupported,
+;;   root-refused, bootstrap.
 (define-error 'rdev-agent-error "rdev agent error" 'file-error)
 (define-error 'rdev-filesystem-error "rdev remote filesystem error" 'file-error)
 (define-error 'rdev-process-error "rdev remote process error" 'file-error)
@@ -696,18 +877,21 @@ capability to stop working on the request (`$/cancel'), then re-signal."
         nil))))
 
 (defun rdev--stat (filename)
-  "Cached remote stat plist for FILENAME, or nil if it doesn't exist."
-  (pcase-let* ((`(,host . ,local) (rdev--parse (expand-file-name filename)))
-               (conn (rdev--conn host))
-               (key (directory-file-name local))
-               (hit (rdev--cache-get conn key)))
-    (if hit
-        (progn (rdev--stat-bump conn :hits)
-               (unless (eq (aref hit 2) :none) (aref hit 2)))
-      (rdev--stat-bump conn :misses)
-      (let ((st (rdev--req host :fs/stat `(:path ,key) filename)))
-        (rdev--cache-put conn key st)
-        st))))
+  "Cached remote stat plist for FILENAME, or nil if it doesn't exist.
+A partial `/rdev:par' name (host not finished) has no remote stat: returning
+nil keeps completion predicates such as `file-exists-p' quiet."
+  (when-let* ((parsed (rdev--parse (expand-file-name filename))))
+    (pcase-let* ((`(,host . ,local) parsed)
+                 (conn (rdev--conn host))
+                 (key (directory-file-name local))
+                 (hit (rdev--cache-get conn key)))
+      (if hit
+          (progn (rdev--stat-bump conn :hits)
+                 (unless (eq (aref hit 2) :none) (aref hit 2)))
+        (rdev--stat-bump conn :misses)
+        (let ((st (rdev--req host :fs/stat `(:path ,key) filename)))
+          (rdev--cache-put conn key st)
+          st)))))
 
 (defun rdev--time (ns) (cons ns 1000000000))
 
@@ -753,10 +937,12 @@ capability to stop working on the request (`$/cancel'), then re-signal."
     (apply operation args)))
 
 (defun rdev--local-temp-file (prefix &optional dir-flag suffix)
-  "Like `make-temp-file' but always create the file on the local machine.
-With a remote `default-directory' (or a remote `temporary-file-directory',
-as callers such as Magit may bind), `make-temp-file' would pick a remote temp
-directory and re-enter the rdev `write-region' handler without end."
+  "Like `make-temp-file' for PREFIX but always create the file locally.
+DIR-FLAG and SUFFIX are as for `make-temp-file'.  With a remote
+`default-directory' (or a remote value of the variable
+`temporary-file-directory', as callers such as Magit may bind),
+`make-temp-file' would pick a remote temp directory and re-enter the rdev
+`write-region' handler without end."
   (let* ((tmp (if (file-remote-p temporary-file-directory)
                   (or (default-toplevel-value 'temporary-file-directory) "/tmp/")
                 temporary-file-directory))
@@ -865,10 +1051,13 @@ OPERATION is the file operation; ARGS are its arguments."
     (cond ((not a) nil) ((not b) t) (t (time-less-p b a)))))
 
 (rdev-defop file-truename (file)
-  (pcase-let ((`(,host . ,local) (rdev--parse (expand-file-name file))))
-    (let ((real (rdev--req host :fs/realpath `(:path ,local) file)))
-      (concat (rdev--prefix host)
-              (if (directory-name-p file) (file-name-as-directory real) real)))))
+  (if-let* ((parsed (rdev--parse (expand-file-name file))))
+      (pcase-let ((`(,host . ,local) parsed))
+        (let ((real (rdev--req host :fs/realpath `(:path ,local) file)))
+          (concat (rdev--prefix host)
+                  (if (directory-name-p file) (file-name-as-directory real) real))))
+    ;; A partial `/rdev:par' name is not a remote path yet; keep it as typed.
+    file))
 
 (rdev-defop file-name-case-insensitive-p (_file) nil)
 (rdev-defop file-ownership-preserved-p (_file &optional _group) t)
@@ -963,33 +1152,68 @@ One `fs/readdir' round trip with attributes (which also warms the attribute
 cache, so completion predicates cost nothing more).  The listing is kept for
 `rdev-cache-ttl' seconds under the same invalidation rules as attributes, so
 successive keystrokes in one directory need no further round trips."
-  (pcase-let* ((`(,host . ,local) (rdev--parse (expand-file-name dir)))
-               (conn (rdev--conn host))
-               (key (rdev--ls-key local))
-               (hit (rdev--cache-get conn key)))
-    (if hit
-        (aref hit 2)
-      (when-let* ((entries
-                   (condition-case err (rdev--readdir dir t)
-                     ;; Transport failures must surface; an unreadable or
-                     ;; missing directory simply has no completions.
-                     ((rdev-connection-lost rdev-ssh-error rdev-transport-error)
-                      (signal (car err) (cdr err)))
-                     (file-error nil))))
-        (let ((names (mapcar (lambda (e)
-                               (cons (aref e 0)
-                                     (equal (plist-get (aref e 1) :ftype) "dir")))
-                             entries)))
-          (puthash key (vector (float-time) (or (rdev-conn-gen conn) 0) names)
-                   (rdev-conn-cache conn))
-          names)))))
+  (when-let* ((parsed (rdev--parse (expand-file-name dir))))
+    (pcase-let* ((`(,host . ,local) parsed)
+                 (conn (rdev--conn host))
+                 (key (rdev--ls-key local))
+                 (hit (rdev--cache-get conn key)))
+      (if hit
+          (aref hit 2)
+        (when-let* ((entries
+                     (condition-case err (rdev--readdir dir t)
+                       ;; Transport failures must surface; an unreadable or
+                       ;; missing directory simply has no completions.
+                       ((rdev-connection-lost rdev-ssh-error rdev-transport-error)
+                        (signal (car err) (cdr err)))
+                       (file-error nil))))
+          (let ((names (mapcar (lambda (e)
+                                 (cons (aref e 0)
+                                       (equal (plist-get (aref e 1) :ftype) "dir")))
+                               entries)))
+            (puthash key (vector (float-time) (or (rdev-conn-gen conn) 0) names)
+                     (rdev-conn-cache conn))
+            names))))))
+
+(defun rdev--host-completion-dir-p (dir)
+  "Non-nil when DIR is the `/rdev:' host-completion prefix.
+That is the state before the host's closing colon has been typed."
+  (and (stringp dir)
+       (string-match-p "\\`/rdev:\\'" dir)))
+
+(defun rdev--host-completion-candidates ()
+  "Host names offered after `/rdev:', each with its closing colon.
+Configured targets, ssh-config hosts and running containers are included;
+the colon lets the user continue with `:/path' immediately."
+  (mapcar (lambda (h) (concat h ":")) (rdev--target-completion)))
+
+(defun rdev--host-completion-name (file)
+  "Strip a leading `rdev:' from FILE for host completion.
+`completion-file-name-table' derives the name with `file-name-nondirectory',
+which does not consult our `file-name-directory' handler, so the name can
+arrive as `rdev:par' instead of `par'."
+  (if (and (stringp file) (string-prefix-p "rdev:" file))
+      (substring file 5)
+    file))
+
+(rdev-defop file-name-directory (file)
+  ;; Split `/rdev:par' into directory `/rdev:' and name `par', so the
+  ;; minibuffer asks for host completions instead of looking in `/'.
+  (if (and (stringp file)
+           (string-match "\\`\\(/rdev:\\)[^:/|]*\\'" file))
+      (match-string 1 file)
+    (rdev--real 'file-name-directory file)))
 
 (rdev-defop file-name-all-completions (file dir)
-  (when-let* ((entries (rdev--completion-entries dir)))
-    (let ((case-fold completion-ignore-case))
-      (cl-loop for (name . isdir) in (append '(("." . t) (".." . t)) entries)
-               when (string-prefix-p file name case-fold)
-               collect (if isdir (concat name "/") name)))))
+  (if (rdev--host-completion-dir-p dir)
+      (let ((case-fold completion-ignore-case)
+            (name (rdev--host-completion-name file)))
+        (cl-remove-if-not (lambda (c) (string-prefix-p name c case-fold))
+                          (rdev--host-completion-candidates)))
+    (when-let* ((entries (rdev--completion-entries dir)))
+      (let ((case-fold completion-ignore-case))
+        (cl-loop for (name . isdir) in (append '(("." . t) (".." . t)) entries)
+                 when (string-prefix-p file name case-fold)
+                 collect (if isdir (concat name "/") name))))))
 
 (defun rdev--prefetch-stats (host locals)
   "Fill HOST's attribute cache for LOCALS with one `fs/statMany' round trip.
@@ -1006,15 +1230,21 @@ fail to stat are simply left uncached, so later single stats report errors."
                                                  (plist-get r :stat))))))))
 
 (rdev-defop file-name-completion (file dir &optional pred)
-  (let ((all (file-name-all-completions file dir)))
-    (when pred                          ; the predicate will stat every candidate
-      (pcase-let ((`(,host . ,local) (rdev--parse (expand-file-name dir))))
-        (rdev--prefetch-stats
-         host (mapcar (lambda (n) (concat (file-name-as-directory local)
-                                          (directory-file-name n)))
-                      (cl-remove-if (lambda (n) (member n '("./" "../"))) all)))))
-    (try-completion file all
-                    (and pred (lambda (n) (funcall pred (expand-file-name n dir)))))))
+  (if (rdev--host-completion-dir-p dir)
+      ;; Host names are not files: ignore the predicate, which would try to
+      ;; stat `/rdev:HOST:' and start a connection for every candidate.
+      (try-completion (rdev--host-completion-name file)
+                      (rdev--host-completion-candidates))
+    (let ((all (file-name-all-completions file dir)))
+      (when (and pred (rdev--parse (expand-file-name dir)))
+        ;; The predicate will stat every candidate.
+        (pcase-let ((`(,host . ,local) (rdev--parse (expand-file-name dir))))
+          (rdev--prefetch-stats
+           host (mapcar (lambda (n) (concat (file-name-as-directory local)
+                                            (directory-file-name n)))
+                        (cl-remove-if (lambda (n) (member n '("./" "../"))) all)))))
+      (try-completion file all
+                      (and pred (lambda (n) (funcall pred (expand-file-name n dir))))))))
 
 (rdev-defop make-directory-internal (dir)
   (pcase-let ((`(,host . ,local) (rdev--parse (expand-file-name dir))))
@@ -1360,7 +1590,19 @@ buffer stays modified; nothing is overwritten silently."
           (rdev--invalidate-tree (car src) (cdr src) (cdr dst)))
       (copy-file file newname t t)
       (if (file-directory-p file) (delete-directory file t) (delete-file file)))
+    (rdev--forget-renamed-version file)
     nil))
+
+(defun rdev--forget-renamed-version (file)
+  "Drop the remote version held by a buffer visiting FILE, which was renamed.
+This Emacs moved the file away itself (most often `backup-buffer' renaming
+it to FILE~ just before a save), so the old version describes no file at
+FILE and must not make the next save report a conflict.  The save then
+recreates FILE, as it would locally; external edits and deletions are
+still detected because only this Emacs's own rename clears the version."
+  (let ((buf (get-file-buffer file)))
+    (when buf
+      (with-current-buffer buf (setq rdev--version nil)))))
 
 (rdev-defop set-file-modes (file mode &optional flag)
   (pcase-let ((`(,host . ,local) (rdev--parse (expand-file-name file))))
@@ -1954,21 +2196,89 @@ already covers `/rdev:' is left alone, so calling this twice is harmless."
 
 ;;;; Commands
 
+(defconst rdev--ssh-config-max-depth 10
+  "Maximum `Include' nesting when reading ssh configuration files.")
+
+(defun rdev--ssh-config-files ()
+  "Return the ssh configuration files to read, in order.
+The user and system configs are included, plus any `-F FILE' given in
+`rdev-ssh-args' (the test fixtures use that form)."
+  (let ((files (list (expand-file-name "~/.ssh/config")
+                     "/etc/ssh/ssh_config"))
+        (args rdev-ssh-args))
+    (while args
+      (let ((arg (pop args)))
+        (cond ((equal arg "-F")
+               (when args (push (expand-file-name (pop args)) files)))
+              ((and (stringp arg) (string-prefix-p "-F" arg))
+               (push (expand-file-name (substring arg 2)) files)))))
+    (nreverse files)))
+
+(defun rdev--ssh-config-blocks ()
+  "Return the `Host' pattern lists from the ssh configuration.
+`Include' files are followed; `Match' conditions are not evaluated, so a
+`Host' line inside one still counts."
+  (let ((seen (make-hash-table :test #'equal))
+        (blocks nil))
+    (cl-labels ((walk (file depth)
+                  (when (and (< depth rdev--ssh-config-max-depth)
+                             (not (gethash file seen))
+                             (file-regular-p file)
+                             (file-readable-p file))
+                    (puthash file t seen)
+                    (with-temp-buffer
+                      (insert-file-contents file)
+                      (goto-char (point-min))
+                      (let ((dir (file-name-directory file)))
+                        (while (not (eobp))
+                          (cond
+                           ((looking-at "^\\s-*Include\\s-+\\(.+\\)$")
+                            (dolist (pat (split-string (match-string 1)))
+                              (dolist (f (file-expand-wildcards
+                                          (expand-file-name pat dir)))
+                                (walk f (1+ depth)))))
+                           ((looking-at "^\\s-*Host\\s-+\\(.+\\)$")
+                            (push (split-string (match-string 1)) blocks)))
+                          (forward-line 1)))))))
+      (dolist (f (rdev--ssh-config-files))
+        (walk f 0)))
+    (nreverse blocks)))
+
 (defun rdev--ssh-hosts ()
+  "Literal host names from the ssh configuration plus configured targets."
   (let (hosts)
-    (dolist (f '("~/.ssh/config"))
-      (when (file-readable-p f)
-        (with-temp-buffer
-          (insert-file-contents f)
-          (while (re-search-forward "^\\s-*Host\\s-+\\(.+\\)$" nil t)
-            (dolist (h (split-string (match-string 1)))
-              (unless (string-match-p "[*?]" h) (push h hosts)))))))
+    (dolist (block (rdev--ssh-config-blocks))
+      (dolist (h block)
+        (unless (or (string-prefix-p "!" h)
+                    (string-match-p "[*?]" h))
+          (push h hosts))))
     (delete-dups (append (mapcar #'car rdev-hosts) (nreverse hosts)))))
+
+(defun rdev--target-completion ()
+  "Host keys for target prompts: configured/known hosts plus containers.
+Configured `rdev-hosts' keys come first (they win over same-named ssh
+aliases), then ssh-config hosts, then running containers as `docker+NAME'
+keys.  Containers come from the engines of configured Docker targets and,
+when `rdev-docker-auto-detect' is non-nil, the local engine.  Discovery
+never blocks the prompt beyond `rdev-docker-discovery-wait' and an
+unreachable engine adds nothing."
+  (delete-dups
+   (append (rdev--ssh-hosts)
+           (when (or rdev-docker-auto-detect (rdev--any-docker-target-p))
+             (condition-case nil
+                 (progn (require 'rdev-docker)
+                        (rdev-docker--completion-hosts))
+               (error nil))))))
+
+(defun rdev--target-table ()
+  "Completion table over `rdev--target-completion', recomputed on demand.
+Containers found by a background discovery appear on the next TAB."
+  (completion-table-dynamic (lambda (_) (rdev--target-completion))))
 
 ;;;###autoload
 (defun rdev-find-file (host)
   "Open a file on HOST through the rdev server."
-  (interactive (list (completing-read "rdev host: " (rdev--ssh-hosts))))
+  (interactive (list (completing-read "rdev host: " (rdev--target-table))))
   (rdev--conn host)
   (let ((default-directory (concat (rdev--prefix host) "~/")))
     (call-interactively #'find-file)))
@@ -1978,7 +2288,7 @@ already covers `/rdev:' is left alone, so calling this twice is harmless."
   "Open an interactive remote shell on HOST (remote PTY)."
   (interactive (list (if (rdev--host default-directory)
                          (rdev--host default-directory)
-                       (completing-read "rdev host: " (rdev--ssh-hosts)))))
+                       (completing-read "rdev host: " (rdev--target-table)))))
   (let ((default-directory (if (equal (rdev--host default-directory) host)
                                default-directory
                              (concat (rdev--prefix host) "~/"))))
@@ -2023,7 +2333,16 @@ With a prefix argument, prompt for a single HOST to clear instead."
                (princ (format "  %-20s home=%s  cached=%d  %s\n" host (rdev-conn-home c)
                               (hash-table-count (rdev-conn-cache c))
                               (concat (if (jsonrpc-running-p (rdev-conn-rpc c)) "up" "DOWN")
-                                      (format "  state=%s" (rdev-state (rdev-state-session-key host)))))))
+                                      (format "  state=%s" (rdev-state (rdev-state-session-key host))))))
+               ;; Docker targets show their container and engine.
+               (when (eq (rdev-conn-transport c) 'docker)
+                 (princ (format "    container %s (%s) on engine %s%s\n"
+                                (or (rdev-conn-container-name c) host)
+                                (substring (or (rdev-conn-container c) "?") 0
+                                           (min 12 (length (or (rdev-conn-container c) "?"))))
+                                (or (rdev-conn-engine c) "local")
+                                (if (rdev-conn-root-mode c)
+                                    "  [root opt-in]" "")))))
              rdev--conns)
     (princ "\nremote processes\n\n")
     (maphash (lambda (_k ch)

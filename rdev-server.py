@@ -2115,10 +2115,6 @@ def main():
         sys.stderr.write("RDEV-ERR python>=3.8 required, found %s\n" %
                          sys.version.split()[0])
         sys.exit(3)
-    if os.geteuid() == 0:
-        sys.stderr.write("RDEV-ERR refusing to run as root (uid 0): the rdev agent "
-                         "must run as an unprivileged user\n")
-        sys.exit(5)
     # Python < 3.9 block-buffers stderr when it is a pipe; warnings must be
     # visible immediately.
     try:
@@ -2135,7 +2131,23 @@ def main():
     ap.add_argument("--allow-non-loopback", action="store_true",
                     help="permit --listen on a non-loopback address "
                          "(plaintext; prefer ssh)")
+    ap.add_argument("--allow-root", action="store_true",
+                    help="permit running as root inside a container "
+                         "(explicit per-target opt-in; not accepted via "
+                         "environment variables or RPC)")
     a = ap.parse_args()
+    # Root refusal.  The default is unconditional; the only override is the
+    # --allow-root command-line flag, which the Emacs client passes only for a
+    # target with :allow-root set.  It is never read from the environment, a
+    # configuration file or RPC, so an ordinary ssh or TCP deployment cannot
+    # become root by accident.
+    if os.geteuid() == 0 and not a.allow_root:
+        sys.stderr.write("RDEV-ERR refusing to run as root (uid 0): the rdev agent "
+                         "must run as an unprivileged user\n")
+        sys.exit(5)
+    if os.geteuid() == 0 and a.allow_root:
+        sys.stderr.write("WARNING: running as root by explicit --allow-root "
+                         "(container opt-in); the agent has full privileges\n")
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     if a.listen:
         host, _, port = a.listen.rpartition(":")

@@ -46,3 +46,17 @@ The macOS *agent-side* pty path was therefore exercised through the local sshd f
 **not run**: a macOS remote host over real ssh from another machine.  An earlier pty run was
 invalid (processes ran locally, no `:file-handler t`); the results above are after that fix.
 
+
+## Docker container targets (2026-11-28)
+
+`make e2e S=docker` — 14 scenarios over real `docker exec` (local engine) plus the
+remote-engine scenario through the disposable sshd.
+
+| Date | Client | Engine / image | Scenarios | Result |
+|---|---|---|---|---|
+| 2026-11-28 | Linux 7.3.6 x86_64, Emacs 31.1 | Docker 29.10.1, `python:3.11-slim` | edit/save, conflict, interrupted save, shell/compile/interrupt/resize, discovery/status, stop/restart/recreate, root policy (per-target and global), disconnect, remote engine, open-by-address without config, Eglot | 13 pass, 1 skip (Eglot: no server in the image) |
+
+The remote-engine scenario uses the throwaway sshd on the same machine as the engine, so a real
+second host was **not** exercised. Docker Desktop, rootless Docker, a macOS client and Emacs 30.1
+were **not** exercised. The fixture's unprivileged container runs as uid 1000 with
+`HOME=/home/dev`; the root-only container has no unprivileged account.

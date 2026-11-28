@@ -23,6 +23,48 @@ ssh is unavailable). Two aliases of one machine share one connection. A second c
 while one is in flight is refused with `rdev-connection-lost` instead of racing.
 Run `M-x` `rdev-state-forget-keys` after changing `~/.ssh/config`.
 
+## Container targets
+
+A Docker target (`:transport docker`) reuses the state machine above. Its session key is
+`docker:<engine>:<container-id>`, where `<engine>` is `local` or the canonical SSH key of
+`:docker-host`. The immutable container ID is part of the key, so a container recreated under the
+same name is a **new session**: the old key is closed, the new one starts with empty caches, and
+`*rdev-log OLD*` records `container replaced: OLD -> NEW`. A restart with the same ID keeps the
+key and bumps the generation.
+
+Every connect and reconnect re-inspects the container. A stopped, paused or removed container
+fails with `not-running` or `not-found`; reconnect attempts continue with the usual backoff and
+end in `FAILED` when they are exhausted.
+
+A plain host name with no `rdev-hosts` entry is always SSH, whatever containers are running. A
+container without a configured entry is reached by its explicit address `docker+NAME` (local
+engine) or `docker+NAME@DH` (the engine reached over SSH at `DH`), for example
+`/rdev:docker+web:/srv/app.py`. The address is parsed, not looked up: it adds nothing to
+`rdev-hosts`, and a configured entry with the same key still wins. Owned processes of a lost
+container are reported interrupted (exit 255) and are never replayed, exactly as for SSH. Buffers
+are untouched.
+
+Typing `/rdev:` in a file prompt completes the host over configured targets, ssh-config hosts and
+running containers, which are offered as `docker+NAME` keys. Containers come from the engines of
+configured Docker targets and, with `rdev-docker-auto-detect` (default t), the local engine;
+containers that already have a configured key are not offered twice.
+
+Completion never waits on Docker. Discovery is one `docker ps` per engine, cached for
+`rdev-docker-discovery-ttl` (5 s) and capped at `rdev-docker-discovery-max` (200). A stale
+snapshot is served at once while a background `docker ps` refreshes it, so new containers show up
+on the next TAB. Only a prompt with no snapshot at all waits, at most `rdev-docker-discovery-wait`
+(0.3 s). A background lookup is killed after `rdev-docker-auto-detect-timeout` (2 s), and a failed
+engine is not queried again for `rdev-docker-discovery-backoff` (30 s). A failed discovery never
+breaks SSH completion. `rdev-docker-list` (which waits for a fresh answer) shows name, ID and
+status; `rdev-docker-connect` accepts a configured key, an address or a bare container name, which
+it connects as `docker+NAME`. `rdev-status` and `rdev-list-connections` show the engine and
+container for Docker targets.
+
+In-container workflows use the same process path as SSH: `shell`, `compile`, `process-file`,
+`make-process` with `:file-handler t`, Eglot, Magit and Dape. Output streams incrementally, exit
+codes and signals are exact, and PTY resize is forwarded. Tools must be installed in the image;
+RDEV installs no packages.
+
 ## Reconnect
 
 Controlled by `rdev-reconnect` (t), `rdev-reconnect-base` (1 s), `-cap` (10 s),

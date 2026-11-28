@@ -17,8 +17,16 @@
                        (hash-table-values rdev--key-hosts))))
 
 (defun rdev-ui--read-host (prompt)
-  "Read a host with PROMPT, offering known and configured hosts."
-  (completing-read prompt (delete-dups (append (rdev-ui--hosts) (rdev--ssh-hosts))) nil nil))
+  "Read a host with PROMPT, offering known and configured hosts.
+Running containers are offered as `docker+NAME' keys (see
+`rdev--target-completion'); the table is recomputed on each completion, so
+a background discovery shows up on the next TAB."
+  (completing-read prompt
+                   (completion-table-dynamic
+                    (lambda (_)
+                      (delete-dups (append (rdev-ui--hosts)
+                                           (rdev--target-completion)))))
+                   nil nil))
 
 ;;;###autoload
 (defun rdev-connect (host)
@@ -63,13 +71,22 @@ asked first when some are running."
           (error "-"))
       "-")))
 
+(defun rdev-ui--target (host)
+  "Target description for HOST: engine/container for Docker targets, else `-'."
+  (let ((c (gethash host rdev--conns)))
+    (if (and c (eq (rdev-conn-transport c) 'docker))
+        (format "docker:%s/%s"
+                (or (rdev-conn-engine c) "local")
+                (or (rdev-conn-container-name c) (rdev-conn-container c) host))
+      "-")))
+
 (defun rdev-ui--row (host)
   "Tabulated-list entry for HOST."
   (let* ((c (gethash host rdev--conns))
          (st (rdev-state (rdev-state-session-key host)))
          (cs (and c (rdev-cache-stats host))))
     (list host
-          (vector host (symbol-name st)
+          (vector host (rdev-ui--target host) (symbol-name st)
                   (rdev-ui--latency host)
                   (number-to-string (rdev-ui--live-procs host))
                   (if cs (format "%d/%d/%d" (plist-get cs :entries)
@@ -99,8 +116,8 @@ asked first when some are running."
   "Major mode listing rdev connections.
 \\{rdev-list-mode-map}"
   (setq tabulated-list-format
-        [("Host" 22 t) ("State" 14 t) ("Latency" 9 nil) ("Procs" 6 nil)
-         ("Cache e/h/m" 14 nil) ("Agent" 10 t) ("Protocol" 9 nil)]
+        [("Host" 22 t) ("Target" 28 t) ("State" 14 t) ("Latency" 9 nil)
+         ("Procs" 6 nil) ("Cache e/h/m" 14 nil) ("Agent" 10 t) ("Protocol" 9 nil)]
         tabulated-list-padding 1
         tabulated-list-entries #'rdev-ui--entries)
   (tabulated-list-init-header))
@@ -128,8 +145,10 @@ asked first when some are running."
 
 ;;;###autoload
 (defun rdev-list-connections ()
-  "List rdev connections: Host, State, Latency, Procs, Cache, Agent, Protocol.
-Keys: c connect, r reconnect, k disconnect, R restart server, l logs, g refresh."
+  "List rdev connections in a tabulated list.
+Columns: Host, Target, State, Latency, Procs, Cache, Agent, Protocol.
+Keys: c connect, r reconnect, k disconnect, R restart server, l logs,
+g refresh."
   (interactive)
   (let ((buf (get-buffer-create "*rdev-connections*")))
     (with-current-buffer buf

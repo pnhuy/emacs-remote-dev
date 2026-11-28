@@ -158,3 +158,25 @@ Each item below has a test that fails without the change and passes with it, unl
 **Still not run:** timed fresh-user walk-through (T112), Windows, a macOS remote host, Emacs
 30.1 and snapshot builds, a real second-uid relay test, `readdir-warm` caching (rdev about 66 ms vs
 TRAMP cache 0.4 ms, needs an invalidation design).
+
+## M5 — Docker container support (2026-11-28)
+
+| Article XII item | Result | Evidence / reason |
+|---|---|---|
+| Functional requirements met | PASS | `test/rdev-docker-test.el` (56 tests), `test/py/test_root_refusal.py` and `test/e2e/docker.el` (14 scenarios) |
+| Existing functionality still works | PASS with one pre-existing flaky test | `make check`: ERT 271/271; Python 216/217 (3.14.10). The failure, `test_watch.WatchSession.test_events_per_backend` (inotify `deleted`), is intermittent and also fails at commit `50007e6` in a clean worktree; see `test/KNOWN-FAILURES.md` |
+| Unit tests | PASS | ERT 56/56 Docker tests; Python root-refusal tests (default refusal, env override refused, `--allow-root` reaches startup, CLI-only) |
+| Integration / E2E | PASS | `make e2e S=docker` 13 pass + 1 skip (Eglot: no language server in the image) on Linux 7.3.6 x86_64, Emacs 31.1, Docker 29.10.1, image `python:3.11-slim`; includes the remote-engine scenario through the disposable sshd |
+| Error and failure paths | PASS | `not-found`, `not-running`, `permission`, `engine-unreachable`, `unsupported`, `root-refused`, `bootstrap`; SSH failures stay `rdev-ssh-error`; interrupted save leaves old/new complete content |
+| Security review | PASS | No new listener; no credential storage; argv-only commands; validated names; root opt-in (per target or global `rdev-docker-allow-root`) warns on every connect, logs, and is command-line-only for the agent; negative tests for listener/token/log redaction |
+| Public interfaces documented | PASS | `docs/README.md`, `docs/connections.md`, `docs/security.md`, `README.md`, `docs/DEVELOPING.md` |
+| Protocol changes | NONE | No new RPC method or framing change; the agent flag is command-line only |
+| Performance | PASS | 50 containers: `docker ps` 63 ms, cold discovery 65.5 ms, cached 0.0 ms; cold first connect 270 ms, warm reconnect 222 ms (`bench/results/docker-discovery-2026-11-28.md`) |
+| Usable through normal workflows | PASS | E2E edit/save, conflict, interrupted save, shell, compile, interrupt, PTY resize, discovery/status, stop/restart/recreate, root policy, disconnect, remote engine, open-by-address without config; `/rdev:` host completion over targets, ssh hosts and containers |
+| Environments not verified | NOT RUN | Docker Desktop, rootless Docker, a real second engine host (the sshd fixture is the same machine), macOS client, Emacs 30.1 |
+
+Notes:
+- The root opt-in is the only exception to the default refusal; the agent's exit 5 is unchanged
+  and pinned by tests.
+- `test/e2e/docker-fixture.sh` leaves no container, listener or temporary file behind; a missing
+  Docker daemon or image is a visible skip.

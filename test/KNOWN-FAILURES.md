@@ -59,3 +59,28 @@ timer may call `auto-revert-buffer` meanwhile.  `test/e2e/notify.el` runs
 with `vc-handled-backends` nil for that reason.  Proper fix: replace
 `jsonrpc-request` in `rdev--req` with an async request plus a flag-based wait
 (planned with the M5 round-trip work, T108).
+
+## Pre-existing flaky test: inotify "deleted" event
+
+`test_watch.WatchSession.test_events_per_backend` (backend `inotify`) intermittently fails with
+`AssertionError: None is not true : deleted`: the delete event is not observed within the test's
+wait. It also fails in a clean worktree at commit `50007e6` (2 of 3 runs), so it is not a
+regression from the Docker work. Exact command:
+
+```sh
+python3 -m unittest discover -s test/py -t test/py -k test_events_per_backend -v
+```
+
+No owner yet; the likely cause is the test's fixed wait racing inotify delivery on a loaded
+machine.
+
+## Docker environments not exercised
+
+These are verification limits, not known defects:
+
+- Docker Desktop and rootless Docker: the transport uses documented CLI behavior, but neither
+  was run.
+- A real second engine host: the remote-engine E2E uses the throwaway sshd on the same machine.
+- A container with a non-standard `HOME`: the `/tmp/rdev-<uid>` fallback is covered by a unit
+  test, not by a real image.
+- macOS client and Emacs 30.1: not run for this feature.

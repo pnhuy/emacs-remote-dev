@@ -80,6 +80,32 @@
             (should-not (file-exists-p (concat (file-local-name remote) "a.txt"))))
         (set-buffer-modified-p nil) (kill-buffer)))))
 
+(ert-deftest rdev-save-first-save-with-rename-backup-is-not-a-conflict ()
+  "Emacs's default backup renames the visited file away before writing.
+That rename is this Emacs's own doing, so the save must not report the
+remote file as changed (as plain `emacs -Q' would otherwise do)."
+  (rdev-test-with-twin-dir (native remote)
+    (let ((local (concat (file-local-name remote) "a.txt"))
+          (before nil))
+      (setq before (rdev-save--slurp local))
+      (with-current-buffer (find-file-noselect (concat remote "a.txt"))
+        (unwind-protect
+            (let ((make-backup-files t) (backup-inhibited nil)
+                  (backup-by-copying nil) (backup-by-copying-when-linked nil)
+                  (backup-by-copying-when-mismatch nil)
+                  (backup-directory-alist nil) (version-control nil)
+                  (rdev-conflict-functions nil))
+              (setq buffer-backed-up nil)
+              (erase-buffer) (insert "after backup")
+              (save-buffer)
+              (should (equal (rdev-save--slurp local) "after backup\n"))
+              (should (equal (rdev-save--slurp (concat local "~")) before))
+              (should-not (buffer-modified-p))
+              ;; the version was refreshed, so later saves still send it and
+              ;; still detect external changes
+              (should (equal (plist-get rdev--version :size) 13)))
+          (set-buffer-modified-p nil) (kill-buffer))))))
+
 (ert-deftest rdev-save-append-stays-non-atomic ()
   (rdev-test-with-twin-dir (native remote)
     (let (methods)

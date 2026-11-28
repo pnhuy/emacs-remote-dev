@@ -54,4 +54,33 @@
     (should-not (file-name-all-completions "" (concat remote "nope/")))
     (should-not (file-name-all-completions "" (concat remote "plain/")))))
 
+;;;; Host completion after `/rdev:'
+
+(ert-deftest rdev-completion-host-after-rdev-colon ()
+  (let ((rdev-hosts '(("rdevtest-alpha" . (:transport docker :container "alpha"))
+                      ("rdevtest-beta" . nil)))
+        (rdev-docker-program
+         (expand-file-name "test/fixtures/fake-docker" rdev-test--root))
+        (rdev-docker-auto-detect nil))
+    (should (equal (all-completions "/rdev:rdevtest-"
+                                    #'completion-file-name-table)
+                   '("rdevtest-alpha:" "rdevtest-beta:")))
+    (should (equal (try-completion "/rdev:rdevtest-al"
+                                   #'completion-file-name-table)
+                   "/rdev:rdevtest-alpha:"))))
+
+(ert-deftest rdev-completion-host-directory-split ()
+  (should (equal (file-name-directory "/rdev:") "/rdev:"))
+  (should (equal (file-name-directory "/rdev:par") "/rdev:"))
+  (should (equal (file-name-directory "/rdev:host:/path") "/rdev:host:/")))
+
+(ert-deftest rdev-completion-host-unique-and-all ()
+  (let ((rdev-hosts '(("rdevtest-only" . nil)))
+        (rdev-docker-auto-detect nil))
+    (should (equal (try-completion "/rdev:rdevtest-on"
+                                   #'completion-file-name-table)
+                   "/rdev:rdevtest-only:"))
+    (should (member "rdevtest-only:"
+                    (all-completions "/rdev:" #'completion-file-name-table)))))
+
 (provide 'rdev-completion-test)

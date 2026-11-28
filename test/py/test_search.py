@@ -197,17 +197,24 @@ class CancelSearch(unittest.TestCase):
         import test_methods_proc as tmp
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
-        line = "x" * 200 + " needle\n"
+        # The pattern must NOT match (and stay far below max_results), so the
+        # scan runs to the end of the data instead of stopping at the result
+        # cap: a matching "needle" finishes the whole search in ~0.2 s on a
+        # fast machine and the cancel loses the race (observed flake).
+        # The cancel is sent with NO sleep: the reader thread processes it
+        # immediately after submitting the search, so it either pre-empts the
+        # worker (pre-check raises -32800) or lands mid-scan (rg is fast
+        # enough that any sleep would let the whole 264 MB scan win).
+        line = "x" * 200 + "\n"
         for i in range(60):
             with open(os.path.join(d, "f%d.txt" % i), "w") as f:
                 f.write(line * 20000)
         h = tmp.StreamingProc()
         h.start()
         self.addCleanup(h.tearDown)
-        rid = h.send("search/grep", root=d, pattern="needle", engine=engine,
-                     max_results=100000, stream=False)
+        rid = h.send("search/grep", root=d, pattern="no-match-needle-zzz",
+                     engine=engine, max_results=100000, stream=False)
         import json, time
-        time.sleep(0.3)
         body = json.dumps({"jsonrpc": "2.0", "method": "$/cancel",
                            "params": {"id": rid}}).encode()
         h.inp.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)

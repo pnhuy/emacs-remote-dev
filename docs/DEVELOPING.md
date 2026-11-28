@@ -5,6 +5,7 @@
 | File | Role |
 |---|---|
 | `rdev.el` | client: file-name handlers, connections, process handlers, jsonrpc.el glue |
+| `rdev-docker.el` | Docker container transport: inspect/discovery, `docker exec` process, root policy |
 | `rdev-state.el` | connection state machine, reconnect/backoff, redacted per-connection log |
 | `rdev-ui.el` | `rdev-list-connections`, mode line, logs, cache inspection |
 | `rdev-project.el` | `project.el` backend (`project/root`, `project/files`) |
@@ -23,7 +24,10 @@ reverse (checked by `test/rdev-load-order-test.el`).
   Intentional changes go in `test/INTENTIONAL-CHANGES.md` with a migration path.
 - Data integrity first: no change may weaken atomic save, conflict detection or
   non-replay of `exec/run` / `proc/spawn`.
-- The agent refuses to run as root. Do not weaken that.
+- The agent refuses to run as root. Do not weaken that. The only exception is the documented
+  `:allow-root` opt-in for Docker containers, set per target or globally with
+  `rdev-docker-allow-root`: it warns on every connect, is logged, and is covered by positive and
+  negative tests. Keep the default refusal and the flag's command-line-only nature intact.
 - Python: standard library only, 3.8-compatible syntax (`test_py38_compat.py`).
 - Emacs: 30.1 or later, built-in libraries first.
 - A bug fix needs a regression test that fails before the fix and passes after.
@@ -51,9 +55,20 @@ sh test/e2e/run.sh baseline                                  # throwaway local s
 RDEV_TEST_SSH_TARGET=myhost sh test/e2e/run.sh baseline      # an existing host
 ```
 
+Docker container targets (real `docker exec`, disposable containers):
+
+```sh
+make e2e S=docker                                            # python:3.11-slim by default
+RDEV_TEST_DOCKER_IMAGE=python:3.11-slim make e2e S=docker
+```
+
+`test/e2e/docker-fixture.sh` starts an unprivileged container and a root-only container, seeds
+`/workspace`, and removes both on stop; it also starts the throwaway sshd for the remote-engine
+scenario. A missing Docker daemon or image is reported as a skip, never a silent pass.
+
 Scenarios: `baseline conflict flood large-file reconnect dired compile workflow magit
 eglot-python eglot-cpp eglot-missing-server eglot-reconnect dape pty save-conflict
-save-fault notify ownership edge-cases`.
+save-fault notify ownership edge-cases docker`.
 Tests that need a missing optional tool (`debugpy`, `pylsp`, `clangd`, Dape) skip with a
 visible reason. `RDEV_TEST_DEBUG=1` turns on extra logging. Fault and conflict trial counts
 are `RDEV_FAULT_TRIALS` and `RDEV_CONFLICT_TRIALS` (default 100).

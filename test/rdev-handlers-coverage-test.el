@@ -11,6 +11,7 @@
     directory-files-and-attributes exec-path expand-file-name file-accessible-directory-p
     file-attributes file-directory-p file-executable-p file-exists-p file-local-copy file-modes
     file-name-all-completions file-name-case-insensitive-p file-name-completion
+    file-name-directory
     file-newer-than-file-p file-notify-add-watch file-notify-rm-watch
     file-notify-valid-p file-ownership-preserved-p file-readable-p
     file-regular-p file-remote-p file-symlink-p file-system-info file-truename file-writable-p
@@ -23,7 +24,7 @@
 (ert-deftest rdev-coverage-op-table-matches-handlers ()
   (let (registered)
     (maphash (lambda (op _) (push op registered)) rdev--ops)
-    (should (= 55 (length registered)))
+    (should (= 56 (length registered)))
     (should (= 7 (length rdev-test--noop-stubs)))
     (let ((accounted (append rdev-test--covered-ops rdev-test--noop-stubs)))
       (should-not (cl-set-difference registered accounted))

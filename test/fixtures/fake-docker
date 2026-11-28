@@ -1,0 +1,88 @@
+#!/bin/sh
+# fake-docker: deterministic Docker CLI double for rdev unit tests.
+#
+# Behaviour is driven by environment variables (all optional):
+#   FAKE_DOCKER_ID          container ID reported by inspect/ps
+#                           (default fakeid0123456789abcdef)
+#   FAKE_DOCKER_RUNNING     true/false for State.Running (default true)
+#   FAKE_DOCKER_USER        Config.User (default empty = image default)
+#   FAKE_DOCKER_UID         output of `id -u' inside the container (default 1000)
+#   FAKE_DOCKER_INSPECT_FAIL  notfound | permission | daemon
+#   FAKE_DOCKER_PS_FAIL     daemon | permission
+#   FAKE_DOCKER_PS_FILE     file whose lines replace the default ps listing
+#   FAKE_DOCKER_PS_COUNT_FILE  file that receives one line per `docker ps'
+#   FAKE_DOCKER_PS_SLEEP    seconds `docker ps' sleeps first (a slow/hung daemon)
+#   FAKE_DOCKER_INSPECT_COUNT_FILE  one line per `docker inspect'
+#   FAKE_DOCKER_EXEC_FAIL   daemon | nosh
+#   FAKE_DOCKER_EXEC_LOG    file that receives the container argument of each `exec'
+#
+# `exec' runs its payload locally with `sh -c' (the "container" is the test
+# machine), so the real bootstrap installs the real agent and the unit tests
+# exercise the full stack without ssh or a daemon.  Never touches the network.
+
+set -u
+
+cmd=${1:-}
+
+case "$cmd" in
+  version)
+    echo "Docker version fake-1.0, build test"
+    exit 0 ;;
+  inspect)
+    if [ -n "${FAKE_DOCKER_INSPECT_COUNT_FILE:-}" ]; then
+      printf 'x\n' >> "$FAKE_DOCKER_INSPECT_COUNT_FILE"
+    fi
+    case "${FAKE_DOCKER_INSPECT_FAIL:-}" in
+      notfound)   echo "Error: No such object: ${4:-?}" >&2; exit 1 ;;
+      permission) echo "docker: Got permission denied while trying to connect" >&2; exit 1 ;;
+      daemon)     echo "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?" >&2; exit 1 ;;
+    esac
+    id="${FAKE_DOCKER_ID:-fakeid0123456789abcdef}"
+    printf '{"Id":"%s","Name":"/%s","Config":{"Image":"fake:latest","User":"%s"},"State":{"Running":%s,"Paused":false,"Status":"up 1 min"}}\n' \
+           "$id" "${4:-fakec}" "${FAKE_DOCKER_USER:-}" "${FAKE_DOCKER_RUNNING:-true}"
+    exit 0 ;;
+  ps)
+    if [ -n "${FAKE_DOCKER_PS_COUNT_FILE:-}" ]; then
+      printf 'x\n' >> "$FAKE_DOCKER_PS_COUNT_FILE"
+    fi
+    if [ -n "${FAKE_DOCKER_PS_SLEEP:-}" ]; then
+      sleep "$FAKE_DOCKER_PS_SLEEP"
+    fi
+    case "${FAKE_DOCKER_PS_FAIL:-}" in
+      daemon)     echo "Cannot connect to the Docker daemon. Is the docker daemon running?" >&2; exit 1 ;;
+      permission) echo "docker: Got permission denied" >&2; exit 1 ;;
+    esac
+    if [ -n "${FAKE_DOCKER_PS_FILE:-}" ] && [ -f "$FAKE_DOCKER_PS_FILE" ]; then
+      cat "$FAKE_DOCKER_PS_FILE"
+      exit 0
+    fi
+    printf 'fakec\t%s\tfake:latest\tUp 1 min\n' "${FAKE_DOCKER_ID:-fakeid0123456789abcdef}"
+    printf 'other\tdeadbeef0000000000000000000000000000000000000000000000000000dead\timg:1\tUp 2 min\n'
+    exit 0 ;;
+  exec)
+    case "${FAKE_DOCKER_EXEC_FAIL:-}" in
+      daemon) echo "Cannot connect to the Docker daemon" >&2; exit 1 ;;
+      nosh)   echo "OCI runtime create failed: exec: \"sh\": executable file not found in \$PATH" >&2; exit 127 ;;
+    esac
+    if [ -n "${FAKE_DOCKER_EXEC_LOG:-}" ]; then
+      # exec -i [--user U] CONTAINER sh -c PAYLOAD
+      if [ "${3:-}" = "--user" ]; then c=${5:-}; else c=${3:-}; fi
+      printf '%s\n' "$c" >> "$FAKE_DOCKER_EXEC_LOG"
+    fi
+    payload=""
+    prev=""
+    for a in "$@"; do
+      if [ "$prev" = "-c" ]; then payload="$a"; break; fi
+      prev="$a"
+    done
+    if [ "$payload" = "id -u" ]; then
+      printf '%s\n' "${FAKE_DOCKER_UID:-1000}"
+      exit 0
+    fi
+    # Run the payload locally: the "container" is the test machine.  Tests bind
+    # HOME to a temp directory so the helper install stays out of the way.
+    exec sh -c "$payload" ;;
+  *)
+    echo "fake-docker: unsupported subcommand: $cmd" >&2
+    exit 64 ;;
+esac

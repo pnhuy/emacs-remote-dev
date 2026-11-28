@@ -17,6 +17,41 @@
 - The JSON-RPC input is validated: bounded headers/messages, typed parameters, no NUL in paths,
   commands as argv (never through a shell unless you ask for `shell-command`).
 
+## Docker container targets
+
+A Docker target keeps the same model: the transport is one `docker exec -i` whose stdin/stdout
+carry the JSON-RPC stream. There is **no new listening socket or published port**, no Docker or
+registry credential is read or stored, and the developer's existing Docker and SSH permissions
+apply. Commands are passed as argv, container names are validated against the Docker charset, and
+the remote `sh -c` payload is quoted with `--` separators. The UID probe and the transport
+address the container by the immutable ID that `docker inspect` just returned, not by name, so a
+container recreated under the same name in between cannot receive the session.
+
+The helper is installed under `$HOME/.cache/rdev`. When `HOME` is unusable it falls back to
+`/tmp/rdev-<uid>/rdev`, but only if the connecting account owns both directories and neither is a
+symlink; a directory planted there by another account is refused (`unsupported`) instead of used.
+
+The helper runs as an unprivileged container account by default. The agent still refuses uid 0
+(exit 5). A container whose only account is root is refused with `root-refused` and the three
+remedies (use an unprivileged account, set `:docker-user`, or enable the opt-in). The opt-in is
+off by default and can be set per target (`:allow-root t`) or globally
+(`rdev-docker-allow-root`); it is the only documented exception to the
+default refusal:
+
+- Every connection to a root container with the opt-in active calls `display-warning` and writes
+  `helper runs with container-root privileges` to the redacted log.
+- The Emacs client passes the agent's `--allow-root` flag **only** when the effective opt-in is
+  active (per target or global). The flag is command-line only: it is never read from an
+  environment variable, a configuration file or RPC, so an ordinary SSH or TCP deployment cannot
+  become root by accident.
+- The global option is broader: use it only on a machine where every container you may connect to
+  is trusted. Per-target `:allow-root` remains the narrower choice. An explicit `:allow-root nil`
+  opts a target out even when the global default is on.
+- A refused connection installs nothing: no helper file, no partial upload, no transport process.
+
+Treat container root as host-equivalent when the container mounts host paths or the Docker socket;
+the opt-in is for development containers that genuinely have no other account.
+
 ## Recommended TCP setup: tunnel over SSH
 The agent's `--listen` mode exists for tests and special setups. It binds loopback only and
 refuses anything else unless `--allow-non-loopback` is given (the traffic is then plaintext and

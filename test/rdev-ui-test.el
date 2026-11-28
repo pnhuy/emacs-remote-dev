@@ -15,13 +15,15 @@
         (rdev-list-connections)
         (with-current-buffer "*rdev-connections*"
           (should (derived-mode-p 'rdev-list-mode))
-          (should (equal '("Host" "State" "Latency" "Procs" "Cache e/h/m" "Agent" "Protocol")
+          ;; The Target column sits between Host and State.
+          (should (equal '("Host" "Target" "State" "Latency" "Procs" "Cache e/h/m" "Agent" "Protocol")
                          (mapcar #'car tabulated-list-format)))
           (let ((row (assoc "test" (funcall tabulated-list-entries))))
             (should row)
-            (should (equal "connected" (aref (cadr row) 1)))
-            (should (string-match-p "ms\\'" (aref (cadr row) 2)))
-            (should (equal "1.1" (aref (cadr row) 6))))
+            (should (equal "connected" (aref (cadr row) 2)))
+            (should (string-match-p "ms\\'" (aref (cadr row) 3)))
+            (should (equal "-" (aref (cadr row) 1))) ; ssh/tcp targets show -
+            (should (equal "1.1" (aref (cadr row) 7))))
           (dolist (k '("c" "r" "k" "R" "l" "g"))
             (should (commandp (lookup-key rdev-list-mode-map k))))))
     (kill-buffer "*rdev-connections*")

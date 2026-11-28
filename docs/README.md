@@ -21,11 +21,66 @@ keys, agents and host-key checking are done by your `ssh`; RDEV stores no creden
 The agent is installed into the remote user's home on first connect, with its hash verified,
 and needs no further steps.
 
+## Docker container targets
+
+A running Docker container is another remote target. It uses the same
+`/rdev:HOST:/path` names, the same agent and the same file and process handlers; the transport is
+one persistent `docker exec -i` instead of `ssh`. Configure a **container target** (also called a
+Docker target):
+
+```elisp
+(setq rdev-hosts
+      '(("demo" . (:transport docker
+                   :container "rdev-demo"   ; defaults to the entry's key
+                   :docker-user "dev"))))   ; optional; defaults to the image user
+```
+
+Then `M-x rdev-find-file RET demo RET`, or open `/rdev:demo:/workspace/hello.txt`. The container
+must be running; `M-x rdev-docker-list` lists running containers and
+`M-x rdev-docker-connect` completes over them.
+
+You do not have to configure a target first: any running container is reachable by its explicit
+address, `/rdev:docker+NAME:/path` on the local engine or `/rdev:docker+NAME@ssh-dest:/path` on an
+engine you reach over SSH. In `C-x C-f`, typing `/rdev:` completes the host part over configured
+targets, ssh-config hosts and running containers (offered as `docker+NAME`), so you can pick a
+container without remembering its name. Discovery runs in the background and completion never
+waits on a slow daemon; a container started a moment ago appears on the next TAB. A plain name
+such as `/rdev:my-container:` is always SSH, so a container can never take over a host name. Set
+`rdev-docker-auto-detect` to nil to stop listing local containers in completion.
+
+The helper is installed under the container user's `$HOME/.cache/rdev` (falling back to
+`/tmp/rdev-<uid>` when `HOME` is unusable), verified by size and SHA-256, and no packages are
+installed.
+
+A container whose only account is root is refused by default. Add `:allow-root t` to that target
+(or set `rdev-docker-allow-root` to t for every Docker target) only if you accept that the helper
+runs with container-root privileges; every connection then warns and records it in the log (see
+`security.md`).
+
+### Containers on a remote Docker engine
+
+Set `:docker-host` to an SSH destination to run the Docker CLI there through your existing SSH
+configuration:
+
+```elisp
+(setq rdev-hosts
+      '(("remote-demo" . (:transport docker
+                          :container "rdev-demo"
+                          :docker-host "dev-server"))))
+```
+
+Local and remote containers with the same name are independent sessions. An unreachable SSH host
+reports `rdev-ssh-error`; a Docker/daemon failure reports `rdev-docker-error` with a reason
+(`not-found`, `not-running`, `permission`, `engine-unreachable`, `unsupported`, `root-refused`,
+`bootstrap`). `:docker-program` overrides the `docker` executable on the engine host.
+
 ## Commands
 
 | Command | Does |
 |---|---|
 | `rdev-find-file` | prompt for a host and open a file or directory on it |
+| `rdev-docker-list` | list running containers on the configured Docker engines |
+| `rdev-docker-connect` | connect to a running container (completion over names) |
 | `rdev-shell` | interactive shell on the host (pty) |
 | `rdev-status` / `rdev-list-connections` | connection state, one row per host, with reconnect and log actions |
 | `rdev-reconnect`, `rdev-disconnect`, `rdev-restart-server` | manage a connection |
